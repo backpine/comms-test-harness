@@ -1,0 +1,1576 @@
+# Standalone Communications Testing Service
+
+**Status:** Scaffold implemented; product build ready to begin
+
+**Research snapshot:** 2026-07-28
+
+**Repository:** [`backpine/comms-test-harness`](https://github.com/backpine/comms-test-harness)
+
+**Name:** `comms-test-harness`
+
+> **Terminology assumption:** “10-stack router” means **TanStack Router**, and “effect atom” means Effect 4's Atom/Atom RPC APIs with `@effect/atom-react`, not the older third-party Effect Atom package.
+
+## 1. Executive decision
+
+Build a lightweight Cloudflare-native communications test harness with two Workers, one D1 database, Cloudflare Email Service, and Twilio for SMS:
+
+1. A very thin **Web Worker** serves a Vite-built React single-page application and proxies only `/rpc` through a private Cloudflare service binding.
+2. An **Effect API Worker** owns application behavior: Effect RPC for the UI, Effect `HttpApi` groups for the future agent API and Twilio webhooks, and Cloudflare email events.
+3. **D1** is the system of record for endpoints, conversations, messages, webhook leases, test runs, idempotency records, and audit events.
+4. **D1 is the only application storage service.** This harness is intentionally low-volume, stores bounded message content, and does not need an R2 bucket or architecture driven by D1's 10 GB account limit.
+5. **Alchemy** owns the cloud resource graph and deployment. Drizzle owns the schema definition and generated SQL. Alchemy creates D1 and applies committed migrations; application startup never performs schema changes.
+6. The browser uses **React + TanStack Router + Effect Atom/Atom RPC**. There is no TanStack Query layer and no duplicated client-state framework.
+7. Outbound email uses Cloudflare Email Service's structured transactional `EMAIL.send({...})` API. We do not need to construct raw MIME for ordinary sends.
+8. Twilio webhook input is parsed and stored without Twilio signature verification in this test harness. Idempotency and endpoint ownership checks still apply, but signature middleware and its credential/configuration are intentionally out of scope.
+
+This split is intentionally small. It keeps the UI same-origin, prevents the browser from addressing the backend Worker directly, and lets Alchemy's Effect-aware Worker bridge manage request/event scopes instead of introducing a hand-built shared Effect runtime.
+
+### 1.1 Scaffold progress
+
+- [x] Create the public `backpine/comms-test-harness` repository and clone it beside the existing projects.
+- [x] Create the Bun monorepo with `apps/api`, `apps/web`, `packages/contracts`, `packages/domain`, and `packages/db` boundaries.
+- [x] Pin the current Alchemy 2, Effect 4, Atom React, Drizzle, React, TanStack Router, Vite, TypeScript, and Bun cohort.
+- [x] Define the Alchemy stack with remote Cloudflare state, an Alchemy-managed D1 database, a private Effect RPC Worker, and a Vite website Worker.
+- [x] Define the `test_records` Drizzle table and generate the first committed migration through Alchemy.
+- [x] Add a schema-validated `hello` RPC that reads D1 through a repository port.
+- [x] Call that RPC on homepage load through Atom RPC and the website's private `/rpc` service binding.
+- [x] Add strict TypeScript, unit tests, browser/website-Worker builds, CI, architecture documentation, and a frozen Bun lockfile.
+- [ ] Authenticate Alchemy to a contributor's Cloudflare account and perform the first live stage deployment. This is intentionally account-owned and is not committed to the repository.
+
+## 2. Product definition
+
+### 2.1 The problem
+
+An external SaaS sends email or SMS to addresses and phone numbers owned by this testing service. The harness captures those messages so either an AI agent or a human operator can inspect them. The harness can then send a realistic reply—for example, requesting a business service—and expose enough state for the test to determine whether the SaaS received, processed, and acted on that reply correctly.
+
+This is an integration-test system, not merely an inbox viewer. Its durable value is a repeatable control loop:
+
+```text
+reserve test endpoint
+        |
+        v
+cause SaaS to send email/SMS
+        |
+        v
+wait for and assert inbound message
+        |
+        v
+send a controlled reply
+        |
+        v
+observe the SaaS's externally visible result
+        |
+        v
+record pass/fail evidence
+```
+
+### 2.2 Primary users
+
+- AI agents calling a stable, schema-validated HTTP API.
+- Developers and operators using a small React console to observe and drive the same workflows.
+- CI jobs running live integration canaries in an isolated stage.
+
+### 2.3 Goals
+
+- Allocate or onboard controlled email and SMS endpoints.
+- Reliably ingest email and SMS with endpoint checks and idempotency.
+- Display endpoints, conversations, message bodies, delivery state, and conflicts.
+- Send safe threaded email replies and SMS replies.
+- Give agents cursor-based read APIs, idempotent write APIs, and bounded wait/assertion operations.
+- Correlate communication with a named test run without depending on proprietary SaaS internals.
+- Provision and deploy the complete Cloudflare footprint through Alchemy.
+- Make staging and production reproducible, observable, recoverable, and safe to destroy selectively.
+
+### 2.4 Non-goals for the first release
+
+- A multi-tenant customer product.
+- End-user signup, roles, billing, or application-managed sessions.
+- General-purpose email hosting or SMS forwarding.
+- Chaining arbitrary pre-existing Twilio webhooks.
+- Becoming an open mail relay or arbitrary SMS gateway.
+- Full email-client behavior such as folders, drafts, contacts, or rich editing.
+- Exactly-once delivery to an external provider; no email or SMS provider can make that guarantee across an application crash boundary.
+- Replacing the external SaaS's own observability. This system proves what it sent and received.
+
+## 3. Research conclusions and technology choices
+
+### 3.1 Version posture
+
+As of the research snapshot:
+
+- Alchemy's stable npm line is `0.93.x`, while the current documentation and repository examples are centered on `alchemy@next` / `2.0.0-beta.x`.
+- Effect 4 and `@effect/atom-react` are still beta packages.
+- Alchemy's current Effect examples target current Effect 4 beta APIs, including `effect/unstable/rpc` and `effect/unstable/reactivity/AtomRpc`.
+- TanStack Router is stable, but it also moves quickly.
+
+The upstream source review used Alchemy commit [`f414e001010ab87a1bbc324692978e99a259eb4a`](https://github.com/alchemy-run/alchemy/commit/f414e001010ab87a1bbc324692978e99a259eb4a), committed on the research date. Package versions must be rechecked against the [Alchemy npm versions](https://www.npmjs.com/package/alchemy?activeTab=versions) and [Effect npm versions](https://www.npmjs.com/package/effect?activeTab=versions) when the independent repository is scaffolded.
+
+Research-time compatibility cohort—not a substitute for the Phase 0 lockfile test:
+
+| Package | Candidate on 2026-07-28 | Basis |
+|---|---:|---|
+| `alchemy` | `2.0.0-beta.65` | npm `next` and researched source |
+| `effect` | `4.0.0-beta.102` | npm beta; Alchemy requires beta 100+ in its current catalog |
+| `@effect/atom-react` | `4.0.0-beta.102` | matched Effect cohort |
+| `drizzle-orm` / `drizzle-kit` | `1.0.0-rc.4` | exact Alchemy source catalog cohort |
+| `react` / `react-dom` | `19.2.8` | current release at research time |
+| `@tanstack/react-router` | `1.170.18` | current release at research time |
+| `vite` | `8.1.5` | current release compatible with Alchemy's Vite 8 cohort |
+| `typescript` | `7.0.2` | exact Alchemy source catalog baseline |
+
+The repository here still has an older Effect 4 beta reference. It is useful for domain patterns, but the standalone project must not copy its package versions; Alchemy's validated Effect cohort controls the new project's initial version selection.
+
+The project should therefore pin **exact versions** for Alchemy, Effect, `@effect/atom-react`, Drizzle, Vite, and TanStack Router in `package.json` and the lockfile. Do not use `latest`, caret ranges, or an automated major/minor update in production. Upgrade those packages together in a dedicated PR that deploys an isolated live Alchemy stage and runs the full smoke suite.
+
+The initial scaffold should use the versions validated on the day it is created—not blindly copy the snapshot above. Record that matrix in `docs/version-matrix.md` and CI output.
+
+### 3.2 Why Alchemy's native Effect Workers matter
+
+Cloudflare isolates can reuse module-level state across requests, while each request still has its own execution context and lifecycle. A naively memoized Effect runtime can accidentally retain request-scoped services, close a scope too early for a streaming response, or let one request wait on work owned only by another request's `waitUntil`.
+
+Alchemy's current Effect Worker bridge explicitly provides per-event scope handling, pins shared initialization to every event context, memoizes only successful initialization, removes request-specific memo state from the reusable context, and transfers response-stream lifetime to the event. The API Worker should use `Cloudflare.Worker`/Alchemy's Effect entrypoint directly. Do not create a module-global `ManagedRuntime` around a plain Worker handler.
+
+Those lifecycle behaviors are visible in the researched [`WorkerBridge.ts`](https://github.com/alchemy-run/alchemy/blob/f414e001010ab87a1bbc324692978e99a259eb4a/packages/alchemy/src/Cloudflare/Workers/WorkerBridge.ts), rather than being an assumption about generic Workers.
+
+The Vite asset Worker is deliberately allowed to remain a tiny ordinary `async fetch` proxy. It has no business services, database connection, or long-lived Effect runtime.
+
+### 3.3 Why Effect RPC and Effect HttpApi both belong here
+
+- **Effect RPC** is the internal, fully typed transport for the React console. The schemas are shared with the browser, and `AtomRpc.Service` turns queries and mutations into stable reactive atoms.
+- **Effect HttpApi** is the external trust boundary. Agents, Twilio, and health probes need ordinary versioned URLs, headers, form bodies, status codes, and schema-validated errors without being Effect/TypeScript clients.
+
+Do not expose Effect RPC as the agent contract. Do not force Twilio webhooks through RPC serialization.
+
+Alchemy's current [Effect HTTP API guide](https://alchemy.run/cloudflare/apis/effect-http-api/) describes the Worker integration, and its [Effect RPC guide](https://alchemy.run/apis/effect-rpc/) describes the typed RPC modality.
+
+### 3.4 Why D1 alone
+
+D1 is the right-sized storage layer for this deliberately low-volume test harness. The application stores normalized metadata and bounded text/HTML projections, not an unlimited archive of raw MIME and attachments. The 10 GB database limit is not a design concern for the expected workload, and adding R2 would create another resource, adapter, retention path, and failure mode without delivering current product value.
+
+The initial and expected production design is therefore D1-only. Inbound bodies and any small attachment payloads we intentionally retain must stay below explicit application limits well under D1's per-value and per-row limits. Oversized content is rejected or recorded as truncated metadata. R2 can be reconsidered only if real usage demonstrates a need; it is not part of the baseline architecture.
+
+### 3.5 Why a dedicated email domain is required
+
+Cloudflare Email Routing controls MX records. The harness must not share a zone whose existing mail delivery matters. Use a dedicated test domain hosted in Cloudflare (for example, `example-test-mail.net`), then route its catch-all address to the API Worker.
+
+Create one catch-all route, not one Cloudflare routing rule per test inbox. Cloudflare's routing-rule limits make per-address infrastructure unsuitable, while a catch-all lets the Worker validate randomly allocated local parts against D1. Unknown or expired addresses are rejected.
+
+Cloudflare documents the Worker email event in its [Email Handler API](https://developers.cloudflare.com/email-service/api/route-emails/email-handler/) and catch-all/custom address behavior in [Email Routing configuration](https://developers.cloudflare.com/email-service/configuration/email-routing-addresses/).
+
+### 3.6 Outbound email is straightforward
+
+Cloudflare Email Service now exposes a structured transactional API directly through the Worker `send_email` binding. Ordinary sends use `env.EMAIL.send({ from, to, subject, html, text, attachments, headers })`; the application does not need to assemble raw MIME or introduce another email provider. The sending domain still has to be onboarded in the user's Cloudflare account. See the [Workers send API](https://developers.cloudflare.com/email-service/api/send-emails/workers-api/) and [Email Sending public-beta announcement](https://developers.cloudflare.com/changelog/post/2026-04-16-email-sending-public-beta/).
+
+Replies can include `In-Reply-To` and `References` through the structured `headers` field. The server derives `from` and `to` from a stored conversation so the harness cannot become an open relay.
+
+## 4. Recommended architecture
+
+### 4.1 Resource topology
+
+```text
+Human browser
+    |
+    | HTTPS, Cloudflare Access
+    v
+console.<domain>
+Web Worker (Cloudflare.Website.Vite)
+    |-- static React assets via ASSETS
+    `-- /rpc/* only
+          |
+          | private service binding (no public URL required)
+          v
+Effect API Worker
+    |-- Effect RPC: UI queries/mutations
+    |-- Effect HttpApi: agent API, health, Twilio webhooks
+    |-- email(message, env, ctx)
+    `-- scheduled(event, env, ctx)         [reconciliation/retention]
+          |
+          v
+         D1
+
+AI agent / CI ----------------------> api.<domain>/v1/*
+                                      bearer or Access service token
+
+Twilio ----------------------------> hooks.<domain>/webhooks/twilio/*
+                                      form parsing + endpoint checks
+
+Cloudflare Email Routing ----------> API Worker email event
+
+API Worker ------------------------> Twilio REST API
+API Worker ------------------------> Cloudflare Email send binding
+```
+
+### 4.2 Why two Workers
+
+| Concern | Web Worker | API Worker |
+|---|---|---|
+| Public role | Console assets and same-origin RPC gateway | Narrow agent and provider endpoints |
+| Runtime style | Tiny native Worker handler emitted by Vite | Alchemy Effect-native Worker |
+| Browser exposure | Yes, behind Access | RPC only through service binding |
+| D1/secrets | None | All application resources |
+| Email/cron events | None | Yes |
+| Deploy coupling | Can change UI without changing webhook code | Can change integrations without rebuilding UI assets |
+
+One Worker can technically serve assets and API routes, but it mixes public provider routes, edge authentication, Vite configuration, business services, and event handlers. The second Worker costs little operationally and creates a meaningful security and failure boundary.
+
+### 4.3 Hostnames and route exposure
+
+- `console.<domain>`: Vite website. Protect the entire hostname with Cloudflare Access.
+- `hooks.<domain>`: API Worker routes only for `/webhooks/twilio/inbound` and `/webhooks/twilio/status`. Do not put this host behind interactive Access.
+- `api.<domain>`: versioned `/v1/*` agent API plus restricted readiness if required.
+- API Worker `workers.dev`: disabled.
+- Web Worker `workers.dev`: disabled in production; optionally enabled only in ephemeral stages.
+- `/health/live`: no dependency checks, minimal response.
+- `/health/ready`: checks essential binding/configuration shape and a bounded `SELECT 1`; protect it or return only a boolean.
+
+Using separate `hooks` and `api` hosts lets security policy remain explicit. A route exception inside one Access application is easier to misconfigure.
+
+### 4.4 Request and event flows
+
+#### Browser query
+
+1. TanStack Router renders a route.
+2. A module-scoped Atom RPC query posts JSON to same-origin `/rpc`.
+3. The Web Worker forwards the unchanged request through its private `BACKEND` service binding.
+4. The API Worker decodes the shared RPC schema, runs an Effect service, and returns JSON.
+5. A mutation carries a `reactivityKeys` value; related query atoms re-fetch.
+
+#### Inbound email
+
+1. Cloudflare accepts mail for the dedicated domain and invokes the Worker's `email` handler.
+2. The handler normalizes the envelope recipient and looks up an active endpoint.
+3. Unknown, expired, or disabled recipients are rejected rather than silently accepted.
+4. The handler parses a bounded projection with `postal-mime` and stores the fields the test harness needs in D1.
+5. It computes a dedupe key, upserts the message and conversation in D1, and writes an audit event.
+6. Oversized content is rejected or explicitly marked truncated; no R2 archive is created.
+
+#### Inbound SMS
+
+1. Twilio posts form-encoded fields to the stable configured URL.
+2. The handler schema-decodes the fields it uses without verifying `X-Twilio-Signature`.
+3. The handler checks the onboarded phone-number lease and expected `To` number.
+4. It idempotently inserts using `MessageSid` as the provider key.
+5. It returns `application/xml` with an empty `<Response></Response>` quickly.
+6. Optional media fetching is bounded and performed only when the product needs it.
+
+#### Outbound reply
+
+1. UI or agent sends an idempotent command referencing a stored inbound message/conversation—not an arbitrary recipient.
+2. The domain service derives the permitted recipient and sender from the endpoint and conversation.
+3. D1 creates a `pending` outbound message and delivery attempt.
+4. The provider adapter sends via Cloudflare Email Service or Twilio.
+5. Provider ID and status are persisted; callbacks append later transitions.
+6. An ambiguous timeout is marked `unknown`, not automatically sent again without a policy decision.
+
+## 5. Standalone repository structure
+
+Use a small Bun workspace so contracts and domain models are shared without publishing packages. Alchemy supports npm, pnpm, and Yarn, but its current [Cloudflare setup guide](https://alchemy.run/cloudflare/setup/) recommends Bun for the best development experience, and its repository/examples are exercised with Bun. Pin Bun in `.tool-versions`, `mise.toml`, or the CI setup action so local and CI behavior match.
+
+```text
+comms-test-harness/
+├── .github/
+│   └── workflows/
+│       ├── ci.yml
+│       ├── deploy-staging.yml
+│       └── deploy-production.yml
+├── apps/
+│   ├── api/
+│   │   ├── src/
+│   │   │   ├── worker.ts                 # Alchemy Effect Worker class
+│   │   │   ├── runtime.ts                # layer assembly only
+│   │   │   ├── rpc/
+│   │   │   ├── http/
+│   │   │   │   ├── agent-api.ts
+│   │   │   │   ├── twilio-webhooks.ts
+│   │   │   │   └── health.ts
+│   │   │   ├── events/
+│   │   │   │   ├── email.ts
+│   │   │   │   └── scheduled.ts
+│   │   │   └── adapters/
+│   │   │       ├── cloudflare-email.ts
+│   │   │       └── twilio.ts
+│   │   └── test/
+│   └── web/
+│       ├── src/
+│       │   ├── routes/                    # TanStack file routes
+│       │   ├── features/
+│       │   ├── atoms/
+│       │   ├── rpc-client.ts
+│       │   ├── router.tsx
+│       │   ├── main.tsx
+│       │   └── web-worker.ts              # /rpc proxy + ASSETS fallback
+│       ├── index.html
+│       └── vite.config.ts
+├── packages/
+│   ├── contracts/
+│   │   └── src/
+│   │       ├── rpc.ts                     # UI RpcGroup and schemas
+│   │       ├── agent.ts                   # public request/response schemas
+│   │       ├── ids.ts
+│   │       └── errors.ts
+│   ├── domain/
+│   │   └── src/
+│   │       ├── endpoint-service.ts
+│   │       ├── message-service.ts
+│   │       ├── test-run-service.ts
+│   │       ├── twilio-onboarding.ts
+│   │       └── ports.ts                   # Context service interfaces
+│   └── db/
+│       ├── src/
+│       │   ├── schema.ts
+│       │   ├── relations.ts
+│       │   ├── repositories.ts
+│       │   └── database.ts
+│       └── migrations/
+├── docs/
+│   ├── architecture.md
+│   ├── operations.md
+│   ├── twilio-onboarding.md
+│   └── version-matrix.md
+├── scripts/                               # bounded smoke/admin tools only
+├── alchemy.run.ts                         # complete resource graph
+├── package.json
+├── bun.lock
+├── tsconfig.base.json
+└── vitest.config.ts
+```
+
+### 5.1 Dependency direction
+
+```text
+contracts       domain
+    ^              ^
+    |              |
+ web           api adapters
+                   |
+                   v
+                  db
+```
+
+- `contracts` contains descriptions and data schemas, never database or Worker bindings.
+- `domain` depends on service interfaces and domain schemas, never Cloudflare globals.
+- `api` supplies live Cloudflare/Twilio/D1 implementations.
+- `web` depends on RPC contracts only.
+- `db` owns SQL schema and repository implementations, not HTTP concerns.
+
+Avoid creating a generic `utils` package. Put code in the narrowest package that owns its meaning.
+
+### 5.2 Suggested scripts
+
+```json
+{
+  "scripts": {
+    "check": "bun run typecheck && bun run test && bun run build",
+    "dev": "alchemy dev",
+    "plan": "alchemy plan",
+    "deploy": "alchemy deploy",
+    "deploy:staging": "alchemy deploy --stage staging",
+    "deploy:prod": "alchemy deploy --stage prod",
+    "destroy": "alchemy destroy",
+    "db:generate": "alchemy deploy scripts/migrations.run.ts --stage migration-dev --yes"
+  }
+}
+```
+
+These commands are implemented and verified against the pinned Alchemy release. The migration command uses a local-state, Drizzle-only Alchemy stack, so generating SQL does not require Cloudflare credentials.
+
+## 6. Alchemy design
+
+### 6.1 Stack responsibilities
+
+`alchemy.run.ts` is the single resource entrypoint. It should provision or bind:
+
+- Cloudflare provider and remote state store.
+- Existing Cloudflare zones by explicit, retained adoption—or a deliberately new dedicated email zone. Never silently create, transfer, or take ownership of a production zone/DNS record.
+- Drizzle schema generation.
+- D1 database with migration directory.
+- Effect API Worker with D1, secrets, the structured email send binding, cron, observability, and routes as those features are implemented.
+- Email routing catch-all to the API Worker.
+- Vite website with private API service binding and SPA asset handling.
+- Custom DNS/routes for console, hooks, and agent API.
+- Cloudflare Access policy/application for the console.
+- Outputs needed by smoke tests, never secret values.
+
+### 6.2 Representative stack shape
+
+This is intentionally illustrative. Alchemy `next` APIs are evolving, so the scaffold phase must compile it against the exact pinned release and use that release's generated types as the authority.
+
+```ts
+import * as Alchemy from "alchemy"
+import * as Cloudflare from "alchemy/Cloudflare"
+import * as Drizzle from "alchemy/Drizzle"
+import * as Effect from "effect/Effect"
+import * as Layer from "effect/Layer"
+
+import Api from "./apps/api/src/worker.ts"
+
+export default Alchemy.Stack(
+  "CommsTestHarness",
+  {
+    providers: Layer.mergeAll(Cloudflare.providers(), Drizzle.providers()),
+    state: Cloudflare.state(),
+  },
+  Effect.gen(function* () {
+    const schema = yield* Drizzle.Schema("app-schema", {
+      schema: "./packages/db/src/schema.ts",
+      out: "./packages/db/migrations",
+      dialect: "sqlite",
+    })
+
+    const database = yield* Cloudflare.D1.Database("app-db", {
+      migrationsDir: schema.out,
+      migrationsTable: "drizzle_migrations",
+      // production resource receives RemovalPolicy.retain(...)
+    })
+
+    // Routes, Access, email routing, and secrets are added when those features
+    // are implemented. D1 remains the only application storage resource.
+
+    const api = yield* Api
+    const website = yield* Website
+
+    return {
+      websiteUrl: website.url.as<string>(),
+      databaseName: database.databaseName,
+    }
+  }),
+)
+```
+
+The researched [Alchemy D1 + Drizzle example](https://github.com/alchemy-run/alchemy/tree/f414e001010ab87a1bbc324692978e99a259eb4a/examples/cloudflare-d1-drizzle) demonstrates this `Drizzle.Schema` → `D1.Database(migrationsDir)` dependency. The researched [TanStack RPC + Drizzle example](https://github.com/alchemy-run/alchemy/tree/f414e001010ab87a1bbc324692978e99a259eb4a/examples/cloudflare-tanstack-rpc-drizzle) demonstrates a Vite/TanStack frontend proxying Effect Atom RPC to a private Worker binding.
+
+### 6.3 Vite website configuration
+
+Alchemy's Vite website resource invokes the project's own Vite build and injects its Cloudflare integration. Remove `@cloudflare/vite-plugin`; do not configure two Cloudflare Vite plugins.
+
+The React app needs a server-environment input so Vite emits the tiny proxy Worker:
+
+```ts
+// apps/web/vite.config.ts
+import { defineConfig } from "vite"
+import react from "@vitejs/plugin-react"
+import { tanstackRouter } from "@tanstack/router-plugin/vite"
+
+export default defineConfig({
+  plugins: [tanstackRouter({ target: "react" }), react()],
+  environments: {
+    ssr: {
+      build: {
+        rollupOptions: { input: "./src/web-worker.ts" },
+      },
+    },
+  },
+})
+```
+
+```ts
+// apps/web/src/web-worker.ts
+type Env = {
+  ASSETS: Fetcher
+  BACKEND: Fetcher
+}
+
+export default {
+  fetch(request: Request, env: Env): Promise<Response> {
+    const path = new URL(request.url).pathname
+    if (path === "/rpc" || path.startsWith("/rpc/")) {
+      return env.BACKEND.fetch(request)
+    }
+    return env.ASSETS.fetch(request)
+  },
+}
+```
+
+Alchemy website properties should include:
+
+- `env: { BACKEND: Api }` for the private service binding.
+- `assets.runWorkerFirst: ["/rpc", "/rpc/*"]` rather than all asset requests.
+- `assets.notFoundHandling: "single-page-application"` so direct navigation to a TanStack route returns `index.html`.
+- An explicit compatibility date and only necessary flags, such as `nodejs_compat` if the selected dependencies require it.
+- Production URL/route configuration with `workers.dev` disabled.
+
+See Alchemy's [Vite](https://alchemy.run/cloudflare/frontend/vite/) and [React SPA](https://alchemy.run/cloudflare/frontend/vite-spa/) guides.
+
+### 6.4 Stages and state
+
+Use Alchemy stages as independently named and independently state-tracked environments:
+
+| Stage | Purpose | External communications |
+|---|---|---|
+| `dev-<developer>` | Personal remote development | Email test subdomain only; no shared Twilio mutation |
+| `pr-<number>` | Ephemeral infrastructure smoke test | Synthetic HTTP/RPC only; no real Twilio number |
+| `staging` | Shared live integration | Dedicated Twilio subaccount/number and email domain |
+| `prod` | Long-lived harness | Explicit approval and retained data resources |
+
+Use `Cloudflare.state()` for shared/CI environments. It stores Alchemy state remotely in Cloudflare rather than on one developer's disk. Use `Alchemy.localState()` only for isolated provider tests where losing state cannot orphan production resources. See [Alchemy state stores](https://alchemy.run/state-store/) and [stages](https://alchemy.run/environments/stages/).
+
+Twilio phone numbers and email MX/catch-all routes are singleton external integrations. A PR stage must never race staging or production for them. Preview stacks stop at synthetic ingress or receive their own dedicated resource.
+
+### 6.5 Removal policies
+
+- D1: retain in production; delete with the ephemeral stage elsewhere.
+- Zones/domains: always retain/import, not casually destroy.
+- Twilio configuration: not an Alchemy-owned resource in Phase 3. It is managed by the application's safe lease workflow because it has external mutable state and conflict semantics.
+- Email routing: use Alchemy's reversible resource, but first prove destroy restores the prior catch-all in an isolated test zone.
+
+`alchemy destroy --stage prod` must not be a path to deleting production messages. Add a CI policy that prevents automatic production destroy.
+
+### 6.6 Secrets
+
+Use these distinct credentials:
+
+- `TWILIO_ACCOUNT_SID`: identifier, not secret.
+- `TWILIO_API_KEY_SID` + `TWILIO_API_KEY_SECRET`: Twilio management/outbound API.
+- Agent API token or Cloudflare Access service-token values.
+- Cloudflare deployment credential in CI, scoped to the resources Alchemy needs.
+
+Use Alchemy/Effect redacted configuration so secret values become Worker secret bindings and are unwrapped only at the provider call. Use Cloudflare Secrets Store if live rotation/shared secret retrieval is a concrete requirement; otherwise ordinary Worker secrets are simpler for the first production release. Never return secrets as stack outputs or log configuration objects.
+
+Generate stable random agent credentials through `Alchemy.Random` or a secret-management workflow whose value persists in remote state. Rotation must permit an overlap window with current and next token.
+
+### 6.7 Migrations: what Alchemy should and should not do
+
+Desired workflow:
+
+1. A developer changes `packages/db/src/schema.ts`.
+2. Drizzle generates a numbered SQL migration and snapshot.
+3. The developer reviews and commits both.
+4. CI verifies generation produces no uncommitted diff.
+5. Alchemy plans the stack.
+6. During deployment, the D1 resource applies unapplied migrations in order and tracks them in `drizzle_migrations`.
+7. Only then should incompatible application behavior be enabled.
+
+Important constraints:
+
+- Do not run `drizzle push` in a Worker startup path.
+- Do not edit an already-applied migration.
+- Ambiguous renames or destructive changes require an explicit, reviewed migration.
+- A successful schema migration followed by a failed Worker deployment can leave the schema ahead of the code. Use expand/contract changes so both old and new code work during the deploy window.
+- Create columns/tables first, backfill in bounded batches, deploy readers, then remove obsolete data in a later release.
+- D1 batches statements transactionally, but the entire infrastructure deployment is not a database transaction. Cloudflare's [D1 binding API](https://developers.cloudflare.com/d1/worker-api/d1-database/) documents batch behavior.
+- Capture a current Time Travel bookmark before risky production migrations and record the exact restore procedure. D1 Time Travel is always enabled on production databases and supports point-in-time restore; see [Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
+
+Start with D1 read replication disabled. If it is later enabled, use D1 Sessions and bookmarks for read-after-write paths; otherwise queries continue to the primary or can violate the UI's expectations. The API documents this under [`withSession`](https://developers.cloudflare.com/d1/worker-api/d1-database/#withsession).
+
+### 6.8 Deployment pipeline
+
+Pull request:
+
+1. Install from frozen lockfile.
+2. Typecheck, lint, unit tests, schema-drift check, and production build.
+3. Run `alchemy plan` and save a human-readable summary.
+4. For infrastructure-affecting PRs, deploy an isolated `pr-*` stage.
+5. Run browser deep-link, RPC, API, and D1 canary tests against the real cloud.
+6. Destroy the preview and prove retained/shared resources were not targeted.
+
+Staging:
+
+1. Deploy automatically after merge.
+2. Run live email and, in a serialized job, live Twilio canaries.
+3. Require staging health and migration evidence before production approval.
+
+Production:
+
+1. Record the D1 Time Travel bookmark and Alchemy plan.
+2. Require approval.
+3. Deploy one stage only; never share state keys with staging.
+4. Run read-only smoke checks plus one controlled synthetic communication.
+5. Roll back application code only if the schema remains backward compatible; otherwise follow the reviewed forward-fix or Time Travel runbook.
+
+Alchemy's test model intentionally exercises real cloud resources; see [Alchemy testing](https://alchemy.run/testing/).
+
+## 7. Effect application design
+
+### 7.1 Service boundaries
+
+Define narrow `Context.Tag` services and implement them in layers:
+
+- `EndpointRepository`
+- `ConversationRepository`
+- `MessageRepository`
+- `TestRunRepository`
+- `WebhookLeaseRepository`
+- `IdempotencyRepository`
+- `InboundEmailParser`
+- `OutboundEmailProvider`
+- `TwilioManagementProvider`
+- `SmsProvider`
+- `Clock` and `IdGenerator`
+- `AuditLog`
+
+Domain programs depend on those ports:
+
+- `reserveEmailEndpoint`
+- `ingestEmail`
+- `sendEmailReply`
+- `inspectTwilioNumber`
+- `onboardTwilioNumber`
+- `reconcileTwilioLease`
+- `offboardTwilioNumber`
+- `ingestSms`
+- `sendSmsReply`
+- `recordDeliveryEvent`
+- `createTestRun`
+- `waitForObservation`
+
+Tests provide in-memory/fake layers. The live API runtime provides D1, Cloudflare Email, Twilio, and clock layers.
+
+### 7.2 HTTP group and RPC composition
+
+Describe external routes as separate Effect HTTP groups, then add them to one API:
+
+```ts
+import * as HttpApi from "effect/unstable/http/HttpApi"
+import * as HttpApiGroup from "effect/unstable/http/HttpApiGroup"
+
+export class HealthGroup extends HttpApiGroup.make("Health")
+  .add(liveEndpoint)
+  .add(readyEndpoint) {}
+
+export class AgentV1Group extends HttpApiGroup.make("AgentV1")
+  .add(createEmailEndpoint)
+  .add(listMessages)
+  .add(sendReply) {}
+
+export class TwilioWebhookGroup extends HttpApiGroup.make("TwilioWebhooks")
+  .add(receiveSms)
+  .add(receiveSmsStatus) {}
+
+export class PublicApi extends HttpApi.make("PublicApi")
+  .add(HealthGroup)
+  .add(AgentV1Group)
+  .add(TwilioWebhookGroup) {}
+```
+
+Each group's `HttpApiBuilder.group` layer should apply the middleware appropriate to that trust boundary:
+
+- `Health`: request ID and safe logging.
+- `AgentV1`: request ID, machine authentication, body limit, idempotency, rate limit, and safe logging.
+- `TwilioWebhooks`: request ID, schema-validated form parsing, body limit, idempotency, and safe logging. Signature verification is intentionally omitted.
+
+Do not apply browser CORS globally. The browser calls same-origin `/rpc`; the external agent API should have no browser CORS unless a later concrete client requires a narrow allowlist.
+
+The implemented blueprint starts with Alchemy's `RpcWorker` shorthand because RPC is its only current surface. When email events and ordinary HTTP routes are added, promote it to an ordinary `Cloudflare.Worker` while preserving the same RPC group and layers. During that later Init phase:
+
+1. Bind D1, the email send binding, and redacted configuration.
+2. Construct HTTP handler-group layers and the Effect RPC handler layer without running request work.
+3. Convert the RPC group to an HTTP effect with `RpcServer.toHttpEffect`.
+4. Mount that effect at exact `POST /rpc` through `HttpRouter.add` alongside the `HttpApiBuilder.layer(PublicApi)` routes.
+5. Yield `HttpRouter.toHttpEffect(...)` once and return it as `{ fetch }`.
+6. Return the `email` and `scheduled` Effect handlers on the same Worker surface when implemented.
+7. Provide Alchemy's binding layers around the Init program, as its D1 example requires.
+
+This keeps one initialized service graph while preserving request/event scope. The exact imports and builder signatures must be compiled against the pinned Effect beta, because these modules are still under `effect/unstable/*`.
+
+### 7.3 Layer lifetime rules
+
+- Build immutable schemas, repositories, provider clients, and router descriptions in Worker initialization.
+- Acquire request URL, headers, tracing context, and request body from request-scoped services only.
+- Never cache a request, `ExecutionContext`, request `Scope`, D1 session bookmark, or per-request logger in a global layer.
+- Use Alchemy's event bridge to execute `fetch`, `email`, and `scheduled` effects.
+- Any background Effect must be attached through the event's supported lifetime (`waitUntil` via the bridge), not forked into an unowned global fiber.
+- Use `Effect.scoped` for MIME streams/provider responses and ensure their scope lasts through consumption.
+
+### 7.4 Error model
+
+Expected failures are tagged schema errors, not defects:
+
+- `EndpointNotFound`
+- `EndpointExpired`
+- `DuplicateAddress`
+- `MessageNotFound`
+- `TwilioNumberNotEligible`
+- `TwilioWebhookConflict`
+- `TwilioConfigurationChanged`
+- `ProviderRejected`
+- `RecipientNotAllowed`
+- `PayloadTooLarge`
+- `RateLimitExceeded`
+- `IdempotencyConflict`
+
+Map them deliberately at boundaries:
+
+- RPC: typed errors for UI-specific recovery.
+- Agent API: stable error code, safe message, request ID, and appropriate 4xx/409/429/5xx status.
+- Twilio: 2xx only after durable idempotent acceptance; provider-safe 5xx when retry is desirable.
+- Email event: reject invalid recipient; fail the event on transient persistence errors according to verified Cloudflare retry semantics.
+
+Unexpected defects are logged with request/event ID and redacted cause. The response never includes a stack trace.
+
+### 7.5 Contract rules
+
+- Use Effect Schema branded IDs and E.164/email normalization at the edge.
+- All timestamps cross APIs as ISO-8601 UTC strings; D1 stores integer epoch milliseconds.
+- Use cursor pagination, not page numbers, for message timelines.
+- Additive response evolution only inside `/v1`; breaking behavior requires `/v2`.
+- Every mutation accepts an `Idempotency-Key` at the agent API. Persist the key, request hash, result reference, and expiry. Reusing a key with a different request returns `409`.
+- Never expose unfiltered headers, Twilio credentials, or internal stack details in list APIs.
+
+## 8. Data design
+
+### 8.1 Core tables
+
+Use text UUIDv7 or ULID identifiers. Use SQLite `INTEGER` for booleans and epoch milliseconds. Keep JSON bounded and validate it with Effect Schema when reading.
+
+#### `endpoints`
+
+| Column | Purpose |
+|---|---|
+| `id` | Branded primary key |
+| `kind` | `email` or `sms` |
+| `address` | Normalized email or E.164, unique |
+| `provider` | `cloudflare_email` or `twilio` |
+| `provider_resource_id` | Twilio phone-number SID; null for email |
+| `status` | `active`, `disabled`, `expired`, or `conflict` |
+| `label` | Operator-friendly optional name |
+| `expires_at` | Optional reservation expiry |
+| `created_at`, `updated_at` | Epoch milliseconds |
+
+Indexes: unique `address`; `(kind, status)`; `expires_at`.
+
+Email reservation generates at least 128 bits of randomness in the local part, for example `inbox_<base32-token>@test-domain`. Do not expose sequential IDs as mail addresses.
+
+#### `conversations`
+
+| Column | Purpose |
+|---|---|
+| `id` | Primary key |
+| `endpoint_id` | Receiving/sending test endpoint |
+| `channel` | `email` or `sms` |
+| `peer_address` | Normalized other participant |
+| `thread_key` | Email root/thread identity or SMS address-pair key |
+| `subject` | Latest normalized email subject, nullable |
+| `last_message_at` | Sort/filter field |
+| `created_at`, `updated_at` | Audit timestamps |
+
+Indexes: `(endpoint_id, last_message_at DESC)` and unique `(endpoint_id, peer_address, thread_key)`.
+
+Email threading uses valid `Message-ID`, `In-Reply-To`, and `References` first, with normalized subject/participants only as a conservative fallback. Never merge solely because two messages have the same subject.
+
+#### `messages`
+
+| Column | Purpose |
+|---|---|
+| `id` | Primary key |
+| `conversation_id`, `endpoint_id` | Relational ownership |
+| `direction` | `inbound` or `outbound` |
+| `provider` | Provider identifier |
+| `provider_message_id` | Twilio SID or email Message-ID when trustworthy |
+| `dedupe_key` | Required deterministic unique ingest key |
+| `status` | `received`, `pending`, `accepted`, `sent`, `delivered`, `failed`, `unknown` |
+| `from_address`, `to_address` | Normalized envelope values |
+| `subject` | Bounded plain text, nullable |
+| `body_text` | Bounded projection, nullable |
+| `body_html` | Sanitized/bounded projection, nullable |
+| `content_truncated` | Whether an application size limit omitted part of the content |
+| `in_reply_to` | Email threading ID, nullable |
+| `references_json` | Bounded list of message IDs |
+| `media_count` | SMS/email attachment count |
+| `provider_error_code`, `provider_error_message` | Sanitized status detail |
+| `occurred_at`, `received_at`, `created_at`, `updated_at` | Timeline fields |
+
+Indexes: unique `dedupe_key`; `(conversation_id, occurred_at, id)`; `(endpoint_id, received_at)`; `(provider, provider_message_id)` where feasible.
+
+Cap text/HTML projections well below the D1 row limit—for example 256 KiB combined. Store attachment metadata initially rather than attachment bodies, and mark oversized content as truncated or reject it. Sanitize HTML on ingestion and render it in a restrictive sandbox; never insert provider HTML directly with unrestricted `dangerouslySetInnerHTML`.
+
+#### `message_events`
+
+Append-only provider and internal transitions:
+
+- `id`, `message_id`, `event_type`, `provider_event_id`, `dedupe_key`
+- `status`, `detail_json`, `occurred_at`, `received_at`
+
+Unique `dedupe_key` prevents repeated Twilio callbacks from duplicating state. The message's current status is a projection derived with monotonic provider-specific transition rules; a late `sent` callback must not regress a terminal `delivered` state.
+
+#### `twilio_webhook_leases`
+
+| Column | Purpose |
+|---|---|
+| `id`, `endpoint_id` | Lease identity |
+| `account_sid`, `phone_number_sid` | Twilio resource identity |
+| `state` | `preparing`, `active`, `conflict`, `releasing`, `released`, `failed` |
+| `original_config_json` | Exact supported SMS configuration snapshot |
+| `installed_url`, `installed_method` | Values owned by this system |
+| `observed_fingerprint` | Hash used for compare-before-change |
+| `conflict_detail_json` | Redacted drift evidence |
+| `leased_at`, `last_checked_at`, `released_at` | Lifecycle timestamps |
+
+Unique active lease per phone-number SID. Secrets never belong in this table.
+
+#### `audit_events`
+
+- `id`, `event_type`, `entity_type`, `entity_id`, `actor_type`, `actor_id`
+- `request_id`, `detail_json`, `occurred_at`
+
+Actors are `agent_token`, `console`, `provider`, `scheduler`, or `system`; they are not application users. Audit lease changes, sends, deletes, retention, authentication failures in aggregate, and manual conflict resolutions. Never store message bodies or secrets in audit JSON.
+
+### 8.2 Phase-later tables
+
+#### `test_runs`
+
+- ID, unique client correlation key, name, status (`open`, `passed`, `failed`, `timed_out`, `cancelled`), metadata, start/deadline/completion timestamps.
+
+#### `test_expectations`
+
+- Test run ID, channel/endpoint, match predicate, status, matched message ID, deadline, diagnostic detail.
+
+Predicates are a limited schema (`from`, `to`, subject/body contains or regex with strict limits, direction, after cursor). Do not execute user-provided JavaScript or unbounded catastrophic regular expressions.
+
+#### `idempotency_keys`
+
+- Scope, key hash, request hash, operation, result entity ID, response status, created/expiry timestamp.
+
+Store a keyed hash rather than the plaintext credential/key if operator readability is unnecessary.
+
+### 8.3 Correlation strategy
+
+Strongest to weakest:
+
+1. Reserve one unique random email address for a test run.
+2. Use one controlled Twilio number plus the SaaS's known E.164 peer and a test start cursor/time.
+3. Use provider threading identifiers.
+4. Match bounded subject/body predicates as a last mile assertion.
+
+Do not rely on a custom header surviving an external SaaS. If the SaaS allows a correlation token in the message body or subject, generate a random one and use it in addition to endpoint isolation.
+
+### 8.4 Retention
+
+Make retention stage-configurable from day one:
+
+- Message projections: proposed 30 days in staging, 90 days in production.
+- Test-run summaries and audit events: proposed 180 days.
+- Idempotency records: operation-specific, generally 24–72 hours.
+- Released webhook snapshots: retain at least through the audit window.
+
+A scheduled job deletes eligible relational rows in bounded batches. Final retention values require a deliberate privacy decision before production.
+
+## 9. Email design
+
+### 9.1 Address allocation
+
+`POST /v1/endpoints/email` creates a D1 endpoint; it does not provision a Cloudflare routing rule. The domain catch-all already points to the Worker.
+
+Rules:
+
+- Cryptographically random local part.
+- Normalize domain and ASCII local part; do not accept arbitrary caller-chosen addresses initially.
+- Optional TTL and label.
+- Never reuse an expired local part.
+- Reject mail to unknown, expired, disabled, or mistyped addresses.
+- Rate-limit allocation and maintain a per-stage cap.
+
+### 9.2 MIME ingestion
+
+Use `postal-mime` (validated against the pinned Workers runtime) to parse:
+
+- `Message-ID`, `In-Reply-To`, `References`, `Reply-To`
+- `From`, `To`, `Cc`, subject, date
+- plain text and HTML bodies
+- attachment metadata
+
+Persist only an allowlisted header subset. Authentication headers can be useful for diagnostics, but redact addresses or tokens where appropriate. Never serialize all headers into logs.
+
+Use the envelope sender/recipient for delivery security, while using parsed `Reply-To` under a strict reply policy. Compute a SHA-256 of the inbound stream plus the endpoint as a fallback dedupe key when Message-ID is absent or duplicated; the bytes do not have to be retained after parsing.
+
+### 9.3 Safe reply policy
+
+An email send request must reference an existing inbound message. The server determines:
+
+- Sender: the test endpoint/domain allowed by the binding.
+- Recipient: validated `Reply-To`, otherwise the stored inbound sender.
+- Subject: `Re:` normalization of the stored subject unless an explicitly bounded override is allowed.
+- Thread headers: stored `Message-ID`/references.
+
+The API must not accept an unconstrained `to` address. This prevents the service becoming an open relay. A future proactive-send feature would need an explicit recipient allowlist and separate authorization.
+
+Remote images are disabled in the console. The first release stores attachment metadata only. If small attachment bodies are later retained in D1, downloads must go through an authenticated API endpoint that checks message ownership, content type, and disposition.
+
+### 9.4 Email constraints to validate in the email phase
+
+- The dedicated domain can enable inbound Email Routing without affecting other mail.
+- The account/plan can onboard the desired outbound sending domain.
+- The Alchemy version can provision `Email.Routing`, catch-all Worker action, and send binding idempotently.
+- Alchemy destroy restores the former catch-all in a disposable zone.
+- Maximum accepted raw size and parse CPU under Workers limits, plus the D1-only truncation/rejection behavior.
+- Reply threading is accepted by at least Gmail and the target SaaS's mail provider.
+
+## 10. Twilio design
+
+### 10.1 Non-negotiable onboarding invariant
+
+The harness owns the number-level inbound SMS webhook only while it has a valid lease. A number is eligible only when its **effective** inbound configuration is known not to displace another integration.
+
+The Twilio IncomingPhoneNumber resource exposes `smsUrl`, `smsMethod`, `smsFallbackUrl`, `smsFallbackMethod`, and `smsApplicationSid`. Twilio documents that a non-empty `smsApplicationSid` causes the number's `sms_*_url` fields to be ignored. See the [IncomingPhoneNumber resource](https://www.twilio.com/docs/phone-numbers/api/incomingphonenumber-resource).
+
+A number may also belong to a Messaging Service. The service can own the common inbound webhook unless it is configured to defer to the sender/number. This must be inspected; looking only at `smsUrl` is not sufficient. See [Messaging Services](https://www.twilio.com/docs/messaging/services) and the [Service resource](https://www.twilio.com/docs/messaging/api/service-resource).
+
+### 10.2 Eligibility matrix
+
+| Live condition | Decision | Reason |
+|---|---|---|
+| SMS-incapable number | Reject | Cannot satisfy product behavior |
+| Non-empty `smsApplicationSid` | Reject | TwiML Application overrides number URL |
+| Non-empty `smsFallbackUrl` | Reject initially | It is an existing SMS integration even if the primary URL is empty |
+| Messaging Service controls inbound webhook | Reject | Number-level write would not safely take effect |
+| Service membership explicitly defers inbound to number | Continue | Number URL is effective, subject to remaining checks |
+| `smsUrl` empty/null | Allow | No existing number webhook |
+| `smsUrl` exactly matches a configured, verified Twilio-default URL | Allow | User-approved default replacement case |
+| `smsUrl` is already this stage's exact URL and a matching active lease exists | Reconcile as already active | Idempotent recovery |
+| `smsUrl` is this system's URL but no matching lease exists | Reject/conflict | Possible orphan; requires explicit adoption workflow |
+| Any other URL | Reject | Existing integration must not be overwritten |
+| Lookup/config changes during onboarding | Abort/retry inspection | Avoid time-of-check/time-of-use overwrite |
+
+### 10.3 What “Twilio default webhook” means
+
+Do not implement this as `url.includes("twilio.com")`, a domain suffix, or a broad regular expression. A customer integration can also be hosted on Twilio.
+
+Maintain a stage configuration `TWILIO_ALLOWED_DEFAULT_SMS_URLS` containing exact normalized URLs. Initially allow:
+
+- Empty/null.
+- Only canonical default/demo URL values observed from a newly purchased number in the dedicated Twilio test account and verified against current Twilio behavior.
+
+The commonly seen Twilio demo URL must not be hard-coded from memory. Phase 3 begins with a live fixture that records a newly provisioned number's API representation, documentation link, trailing-slash/method form, and a reviewed allowlist update. URL normalization may normalize scheme/host case and a deliberately chosen trailing-slash rule; it must not discard path, query, port, or origin differences.
+
+Fail closed when Twilio changes its default.
+
+### 10.4 Onboarding state machine
+
+```text
+inspect
+  | ineligible/conflicting
+  +--------------------------> rejected (no mutation)
+  |
+  v eligible
+preparing lease snapshot
+  |
+  v compare-before-write
+install webhook
+  |
+  v read-after-write verification
+active
+  |              |
+  | drift        | requested offboard
+  v              v
+conflict       releasing
+                 |
+                 v compare live value == ours?
+              yes | no
+                  |  `-------------> conflict (do not overwrite)
+                  v
+              restore snapshot
+                  |
+                  v verify -> released
+```
+
+Detailed onboarding algorithm:
+
+1. Normalize the E.164 number and locate its IncomingPhoneNumber SID in the configured account/subaccount.
+2. Fetch the complete live number resource and its Messaging Service membership/effective inbound behavior.
+3. Evaluate the eligibility matrix without mutating anything.
+4. Persist a `preparing` lease with the exact prior SMS configuration—including application and fallback guard fields—effective-service snapshot, desired stage URL/method, and a canonical fingerprint.
+5. Re-fetch immediately before update. If the fingerprint differs, mark conflict and abort.
+6. Update only `smsUrl` and `smsMethod=POST`. Do not touch voice, fax, emergency address, friendly name, or unrelated fallback fields.
+7. Read after write and require an exact match.
+8. Mark the endpoint and lease active, then append an audit event.
+9. If the update response is ambiguous, inspect before retrying; do not blindly issue another mutation.
+
+Twilio's API does not provide a documented conditional update for this resource, so a residual race exists between final read and write. Restrict Twilio console access and serialize onboarding/offboarding per number. The reconcile job detects—not overwrites—later drift.
+
+### 10.5 Reconciliation
+
+A scheduled Effect program checks each active lease:
+
+- Resource still exists in the expected account.
+- SMS capability remains present.
+- No `smsApplicationSid` appeared.
+- No `smsFallbackUrl` appeared.
+- Messaging Service still defers to number when applicable.
+- `smsUrl` and method still exactly equal the installed values.
+
+On drift:
+
+- Mark the lease and endpoint `conflict`.
+- Stop outbound sends from that endpoint.
+- Surface a high-signal console warning and metric.
+- Never restore or re-install automatically.
+
+### 10.6 Safe offboarding
+
+1. Read the live resource.
+2. Compare the installed URL/method and every application/fallback/service guard field with the active-lease snapshot.
+3. If they differ, mark conflict and stop. Do not overwrite the third party's newer configuration.
+4. If they match, set the lease to `releasing` and restore only the exact original `smsUrl` and `smsMethod` values. The application and fallback fields were never changed by this service and must never be cleared or rewritten during release.
+5. Read after write and verify.
+6. Mark released and disable the endpoint.
+
+Provide a manual “force” tool only after the normal workflow is proven. It must display the current and proposed values, require explicit confirmation, and audit the actor. It should not be available through the ordinary agent API.
+
+### 10.7 Webhook input handling
+
+This test harness intentionally does not verify `X-Twilio-Signature`. Adding the SDK, auth-token secret, exact-origin reconstruction, middleware, and verification test matrix is unnecessary for the small controlled deployment this project targets.
+
+The handler still schema-decodes a bounded form body, requires the fields used by the application, checks that `To` belongs to an active leased endpoint, and deduplicates by `MessageSid`. A future deployment exposed to untrusted high-volume traffic may revisit signature verification as an optional hardening feature; it is not part of the current architecture.
+
+### 10.8 Inbound idempotency and TwiML
+
+Twilio may retry webhooks. Use `(provider, MessageSid)`/a derived dedupe key as a unique constraint. If the same request arrives again, return the same successful empty TwiML response after confirming the durable record exists.
+
+Return:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Response></Response>
+```
+
+Do not perform an immediate SMS reply in the inbound TwiML for this product. Persist first, then let a deliberate agent/UI command reply. Twilio documents messaging request/response behavior in [Messaging webhooks](https://www.twilio.com/docs/usage/webhooks/messaging-webhooks).
+
+If retry connection overrides are configured, record and use `I-Twilio-Idempotency-Token` as supplemental diagnostics, while keeping Message SID as the business dedupe key. See [webhook connection overrides](https://www.twilio.com/docs/usage/webhooks/webhooks-connection-overrides).
+
+### 10.9 Outbound SMS and delivery callbacks
+
+- Derive `From` from the onboarded endpoint and `To` from the selected conversation.
+- Validate E.164 and restrict to controlled/test recipients where practical.
+- Attach a unique status callback URL to each outbound message.
+- Persist Twilio Message SID and apply status transitions monotonically.
+- Deduplicate repeated/out-of-order callbacks.
+- Treat provider acceptance separately from delivery.
+- Observe Twilio opt-out and messaging compliance behavior even for test traffic; use a dedicated subaccount and low volume.
+
+The Message resource and statuses are documented in Twilio's [Message API](https://www.twilio.com/docs/messaging/api/message-resource).
+
+### 10.10 Do not chain existing webhooks in MVP
+
+It is tempting to accept a number with an existing webhook and have this service forward to it. Do not. Forwarding changes source signatures, timing, retries, response/TwiML semantics, failure ownership, and privacy. It would make the harness a critical proxy for an unknown production integration. The safe MVP behavior is an explicit rejection.
+
+## 11. External agent API
+
+The API is intentionally small and resource-oriented:
+
+### 11.1 Endpoints
+
+```text
+POST   /v1/endpoints/email
+GET    /v1/endpoints
+GET    /v1/endpoints/{endpointId}
+DELETE /v1/endpoints/{endpointId}             # disable/expire, not unsafe Twilio force-delete
+
+POST   /v1/endpoints/twilio/inspect
+POST   /v1/endpoints/twilio/onboard
+POST   /v1/endpoints/{endpointId}/offboard
+
+GET    /v1/endpoints/{endpointId}/messages
+GET    /v1/conversations/{conversationId}
+POST   /v1/conversations/{conversationId}/replies
+
+POST   /v1/test-runs
+GET    /v1/test-runs/{runId}
+POST   /v1/test-runs/{runId}/expectations
+POST   /v1/test-runs/{runId}/complete
+
+GET    /health/live
+GET    /health/ready
+```
+
+### 11.2 Waiting for a message
+
+Start with bounded polling rather than WebSockets or a Durable Object:
+
+```http
+GET /v1/endpoints/{id}/messages?after=<cursor>&wait=20s
+```
+
+The server may short-poll internally up to a strict maximum and return:
+
+- `200` with matching messages and next cursor.
+- `204`/an empty list at timeout.
+- `410` if the endpoint expired.
+
+Clients must tolerate retry and use cursors. If long-poll volume becomes significant, add a Durable Object notification coordinator as a measured later optimization; keep D1 as the source of record.
+
+### 11.3 Authentication and authorization
+
+“No users/login” does not mean “unauthenticated production API.” Use one of:
+
+- Preferred for Cloudflare-aware agents/CI: Cloudflare Access service token on `api.<domain>`.
+- Simple first release: a generated bearer token stored as a Worker secret, with current/next rotation.
+
+Restrict powerful Twilio onboarding/offboarding operations to a separate admin credential or the Access-protected console. A routine test agent needs endpoint reservation, reads, sends to existing conversations, and test runs—not infrastructure takeover.
+
+### 11.4 Response and observability contract
+
+Every response includes `requestId`. Errors use a stable code:
+
+```json
+{
+  "error": {
+    "code": "TWILIO_WEBHOOK_CONFLICT",
+    "message": "The number already has a non-default inbound integration.",
+    "requestId": "..."
+  }
+}
+```
+
+Do not expose the existing webhook URL to routine agents; provide redacted origin/path detail only to protected operators.
+
+## 12. React console
+
+### 12.1 Route map
+
+```text
+/                              overview and system health
+/endpoints                     email/SMS endpoints, state, filters
+/endpoints/$endpointId         endpoint details and conversations
+/conversations/$conversationId message timeline and reply composer
+/runs                          test-run history
+/runs/$runId                   assertions and evidence
+/settings/twilio               inspect/onboard/offboard/conflicts
+/operations                    ingest/send failures and reconciliation
+```
+
+Use TanStack Router file-based routes. Put selected entity IDs in route params and filters/cursors in validated search params. Do not duplicate URL state in atoms.
+
+### 12.2 Effect Atom pattern
+
+Current Effect 4 exposes Atom RPC from `effect/unstable/reactivity/AtomRpc` and React bindings from `@effect/atom-react`:
+
+```ts
+import * as Layer from "effect/Layer"
+import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient"
+import * as AtomRpc from "effect/unstable/reactivity/AtomRpc"
+import { RpcClient, RpcSerialization } from "effect/unstable/rpc"
+
+export class ConsoleClient extends AtomRpc.Service<ConsoleClient>()(
+  "ConsoleClient",
+  {
+    group: ConsoleRpcs,
+    protocol: RpcClient.layerProtocolHttp({ url: "/rpc" }).pipe(
+      Layer.provide(FetchHttpClient.layer),
+      Layer.provide(RpcSerialization.layerJson),
+    ),
+  },
+) {}
+```
+
+Create atoms once at module scope or as parameterized families:
+
+- `endpointsAtom(filters)` → reactivity key `endpoints`
+- `endpointAtom(id)` → `endpoint:<id>`
+- `conversationAtom(id)` → `conversation:<id>`
+- `replyMutation` invalidates the conversation and endpoint summary keys
+- `twilioInspectionAtom(number)` remains explicit/manual, not continuously executed
+
+Use `Atom.withRefresh` for low-frequency polling (for example 3–5 seconds while a timeline is visible), stale-while-revalidate behavior, and refresh-on-window-focus. Pause polling when the tab/route is inactive. Do not layer TanStack Query over Atom RPC.
+
+### 12.3 UI safety
+
+- Show plain text by default.
+- Render sanitized email HTML in a sandboxed iframe with scripts, forms, top navigation, and remote resources disabled.
+- Do not auto-load tracking pixels.
+- Require confirmation for send, Twilio onboarding, and offboarding.
+- Display lease conflicts prominently; never offer a one-click silent overwrite.
+- Use accessible status text in addition to color.
+- Keep message lists virtualizable but do not add a large component framework unless demonstrated necessary.
+
+### 12.4 Edge access control
+
+A public dashboard containing email/SMS content is not production-ready. Cloudflare Access is the minimum acceptable perimeter even though the application itself has no users. Alchemy should provision an [Access Policy](https://alchemy.run/providers/cloudflare/access/policy/) and a self-hosted [Access Application](https://alchemy.run/providers/cloudflare/access/application/) for the console domain.
+
+For a single operator, an email allowlist/OTP is enough. For a team, use the existing identity provider. The application receives only trusted Access headers for audit display and does not create a user record.
+
+If interactive access of any kind is categorically disallowed, deploy only to a local/private development environment or remove the human console from production. “No application auth” is compatible with this design; “public PII inbox” is not.
+
+## 13. Security, privacy, and abuse controls
+
+### 13.1 Trust boundaries
+
+| Boundary | Control |
+|---|---|
+| Browser → console | Cloudflare Access, same-origin RPC, secure headers |
+| Web Worker → API Worker | Private service binding, narrow proxy path |
+| Agent → API | Access service token or rotating bearer token, rate limit |
+| Twilio → webhook | Bounded schema decoding, endpoint ownership check, and MessageSid idempotency |
+| Email → Worker | Cloudflare routing event, D1 endpoint allowlist |
+| API Worker → provider | Least-privilege credentials, bounded destination policy |
+
+### 13.2 Required controls
+
+- CSP, `frame-ancestors 'none'`, `nosniff`, strict referrer policy, and no wildcard CORS.
+- Same-origin RPC accepts POST only and enforces content type/body size.
+- Agent and provider routes have distinct rate limits.
+- No message bodies, auth headers, tokens, or full phone/email values in normal logs. Use stable hashes/redacted suffixes.
+- Bound MIME/form/JSON size and parse time.
+- Attachment content-type sniffing; never execute or inline active content.
+- HTML sanitizer pinned and covered by malicious fixtures.
+- Twilio media, if implemented, is fetched with provider authentication, a size cap, timeout, and content allowlist.
+- Secrets use redacted configuration and least privilege.
+- Dependency lockfile, provenance/audit in CI, and deliberate beta-stack upgrade tests.
+- Separate Twilio subaccount and phone number for the harness to limit blast radius.
+
+### 13.3 Data minimization
+
+This service intentionally handles personal communication content. Before production, document:
+
+- Who can send to each test endpoint.
+- What content the target SaaS may include.
+- Retention and deletion behavior.
+- Whether production customer data is prohibited.
+- Geographic/account requirements.
+- How an operator exports evidence and how that export expires.
+
+Default test fixtures to synthetic people/businesses. Never use the service as an uncontrolled sink for production customer communications.
+
+## 14. Reliability and observability
+
+### 14.1 Delivery semantics
+
+- Inbound provider events are at-least-once: dedupe in D1.
+- D1 uniqueness is the final idempotency guard, not in-memory caches.
+- Sending has an unavoidable ambiguity if the provider accepted a request but the Worker failed before persisting the response. Mark such attempts `unknown`; automated resend risks duplicates.
+
+For deferred sends, use a D1-backed outbox state plus a scheduled scan of stale `pending` records. This cannot create exactly-once provider delivery, so expose ambiguity honestly in the UI/API. Do not add a queue until measurements demonstrate that a scheduled D1 outbox is insufficient.
+
+### 14.2 Metrics and logs
+
+Enable Workers observability in Alchemy. Start with high sampling at low test volume, then tune deliberately. Emit structured events with:
+
+- `stage`, Worker name, event type, request/event ID
+- endpoint/message/run IDs
+- provider and operation
+- duration and outcome
+- retry/dedupe flag
+- redacted error class
+
+Key metrics:
+
+- Inbound count and failure rate by channel.
+- Duplicate webhook/event count.
+- Ingest latency from provider timestamp to durable record.
+- Outbound accepted/delivered/failed/unknown count and latency.
+- Active/conflicted Twilio leases and reconciliation age.
+- D1 latency/error/overload rate.
+- Expired endpoint and retention backlog.
+- Agent wait success/timeout latency.
+
+Never label metrics with raw email, phone, subject, or message ID; cardinality and privacy both suffer.
+
+### 14.3 Health
+
+- Liveness proves the code can answer.
+- Readiness performs a short D1 check and validates required non-secret binding presence; it does not call Twilio or send email.
+- A scheduled canary—not readiness—reserves an endpoint, delivers a synthetic message, waits for ingest, and optionally sends a reply.
+- Twilio and email provider status should be represented as recent-canary/reconciliation state, not a blocking dependency for every request.
+
+### 14.4 Recovery
+
+- Retain prod D1 under Alchemy removal policy.
+- Record D1 Time Travel bookmarks before risky releases.
+- Quarterly: restore staging from a point in time and verify message/conversation consistency.
+- Quarterly: offboard and re-onboard the staging Twilio number, including exact prior-config restoration.
+- Keep an operator runbook for orphaned Twilio webhook, lease conflict, D1 overload, and outbound ambiguity.
+
+D1 currently processes each individual database's queries serially and can return overload errors when its queue fills, so indexes and bounded queries matter even at modest scale. Cloudflare describes this behavior in [D1 limits](https://developers.cloudflare.com/d1/platform/limits/#frequently-asked-questions).
+
+## 15. Phased implementation plan and acceptance tests
+
+Each phase ends in a deployable vertical slice. Do not begin the next phase merely because code exists; meet the exit criteria in the target Cloudflare stage.
+
+### Phase 0 — Prove the platform skeleton
+
+**Build**
+
+- [x] Create the independent public repository and pinned Bun workspace.
+- [x] Pin Alchemy `next`, Effect 4 beta, Effect Atom React, Drizzle, Vite, React, TypeScript, Bun, and TanStack Router versions.
+- [x] Add remote Cloudflare state, named-stage scripts, and Cloudflare/Drizzle provider layers.
+- [x] Define a minimal D1 database through `Drizzle.Schema` and commit its generated migration/snapshot.
+- [x] Create the private Effect RPC Worker with one `hello` RPC that queries D1.
+- [x] Create the Vite React SPA, TanStack Router, Atom RPC client, and thin `/rpc` service-binding proxy.
+- [x] Configure SPA fallback, an explicit compatibility date, and disabled backend `workers.dev` exposure.
+- [x] Add CI, strict typechecking, a domain unit test, and browser/website-Worker build checks.
+- [ ] Add liveness/readiness HTTP endpoints when the ordinary HttpApi surface is introduced.
+- [ ] Configure custom staging domains, Worker observability, and Cloudflare Access when account/domain choices are available.
+- [ ] Add the real-cloud integration-test harness after the first account-owned stage is deployed.
+
+**Test**
+
+- [x] Unit: the domain hello program returns schema-backed data from a repository port.
+- [x] Build: strict TypeScript, browser bundle, and website proxy Worker bundle compile.
+- [x] Migration: Alchemy generates a reviewable initial SQL migration and snapshot; a second generation is a no-op.
+- [x] Isolation: the API RPC Worker is configured with no public `workers.dev` URL.
+- [ ] Live: deploy to a Cloudflare account, load `/`, and prove `/rpc` reaches the private API and reads the migrated D1 table.
+- [ ] Deploy: prove a second live deployment is a no-op and preview destroy targets only its own stage.
+
+**Exit**
+
+- One command deploys staging from an empty Alchemy state.
+- One command destroys an isolated preview without targeting retained/shared resources.
+- The checked-in version matrix and exact smoke evidence are recorded.
+- No real Twilio number or production MX route has been changed.
+
+### Phase 1 — Receive and inspect email
+
+**Build**
+
+- Provision the dedicated email routing domain/catch-all to the API Worker.
+- Implement random email endpoint allocation and expiration.
+- Implement bounded MIME parsing, D1 persistence, dedupe, conversation creation, and audit.
+- Add endpoint/conversation/message RPC queries.
+- Build endpoint list and read-only conversation timeline UI.
+- Add retention configuration but do not enable destructive cleanup until tested.
+
+**Test**
+
+- Unit fixtures: plain text, HTML, multipart alternative, attachment, Unicode headers, malformed MIME, missing/duplicate Message-ID, oversized projection, plus-address, and malicious HTML.
+- Property: generated local parts normalize and never collide in a large deterministic sample.
+- Repository: duplicate content/message keys create one logical message.
+- Security: unknown/expired address rejects; HTML cannot execute; remote image is not loaded.
+- Live: send mail from two independent providers to a reserved staging address and observe exactly one conversation/message each.
+- Live retry: replay the same MIME event fixture and prove idempotency.
+- Size: oversized bodies/attachments follow the documented D1-only rejection or truncation policy.
+
+**Exit**
+
+- An agent can reserve an address, an actual external sender can email it, and the UI/API shows the bounded durable content needed for the test.
+
+### Phase 2 — Send safe email replies
+
+**Build**
+
+- Onboard the Cloudflare Email Service sending domain and bind its structured transactional API.
+- Implement reply-by-message/conversation only, recipient derivation, thread headers, status, and audit.
+- Add reply composer and delivery state to UI.
+- Add idempotency keys and pending/unknown send attempt model.
+- Use the structured `EMAIL.send({...})` builder for text, HTML, attachments, and thread headers; do not construct raw MIME.
+
+**Test**
+
+- Unit: Reply-To selection, fallback sender, subject normalization, `In-Reply-To`/`References`, Unicode, header injection, arbitrary-recipient rejection, and idempotency conflict.
+- Adapter: provider success, hard reject, timeout-before-send, and ambiguous timeout-after-acceptance.
+- Live: reply to Gmail and the target SaaS provider; verify visible threading and sender authentication results.
+- Abuse: attempt to supply a different recipient and prove the server ignores/rejects it.
+- UI: double-submit sends one command and displays `unknown` without blind resend on ambiguity.
+
+**Exit**
+
+- A stored inbound email can receive a later agent/UI reply at its derived sender, threads correctly, and cannot be abused as a generic relay.
+
+### Phase 3 — Safely onboard Twilio and ingest SMS
+
+**Build**
+
+- Add the Twilio REST management adapter with API-key credentials.
+- Add inspect-only endpoint and eligibility report.
+- Establish the verified exact Twilio-default URL allowlist from a live clean-number fixture.
+- Implement lease snapshot, compare-before-write, minimal update, read-after-write, conflict, reconciliation, and safe offboarding.
+- Implement schema-decoded form webhook input, durable dedupe, empty TwiML response, and SMS timeline without signature verification.
+- Add protected Twilio settings UI.
+
+**Test**
+
+- Unit matrix: empty URL, each verified default, arbitrary URL, near-match malicious URL, own URL with/without lease, application SID, fallback URL, controlling Messaging Service, deferred service, incapable number, wrong account.
+- Form vectors: required/missing fields, repeated field, unknown field, malformed body, oversized body, and duplicate `MessageSid`.
+- State machine: crash/timeout before update, ambiguous update, drift between reads, verification mismatch, concurrent onboarding, and idempotent recovery.
+- Offboarding: restore only when current config is exactly ours; drift always produces conflict.
+- Live serialized test on staging subaccount: inspect clean number, onboard, receive a real SMS, replay webhook, detect deliberate drift, resolve, offboard, and verify byte-for-byte supported config restoration.
+- Isolation: PR stages cannot access the staging Twilio mutation credential.
+
+**Exit**
+
+- The harness can prove it did not overwrite an existing integration, ingest one real SMS exactly once logically, detect drift, and restore its prior configuration safely.
+
+### Phase 4 — Send SMS and track delivery
+
+**Build**
+
+- Implement reply-only SMS sends from an active, non-conflicted leased endpoint.
+- Add Twilio status callback parsing, event history, monotonic state projection, and UI display.
+- Fetch MMS media only if needed; retain bounded metadata or small content in D1 under explicit limits.
+
+**Test**
+
+- Unit: recipient derivation, disabled/conflicted endpoint rejection, callback decoding, duplicate/out-of-order statuses, provider error mapping, and media limits.
+- Failure injection: accepted send with lost response becomes `unknown`; no automatic duplicate.
+- Live: send to a controlled handset/test number, observe accepted/sent/delivered or documented terminal status, and verify callback audit.
+- Compliance: STOP/opt-out behavior is documented and the harness does not attempt prohibited retry.
+
+**Exit**
+
+- An inbound SMS conversation can receive a controlled reply and exposes honest provider delivery state.
+
+### Phase 5 — Agent workflows and test runs
+
+**Build**
+
+- Finalize versioned agent endpoints, machine authentication, scoped admin/test credentials, and rate limits.
+- Add test runs, expectations, cursors, bounded wait, evidence links, and pass/fail completion.
+- Add run list/detail UI and API examples/OpenAPI generated from the Effect schema where supported.
+- Add a tiny reference agent client or typed script, not a second SDK framework.
+
+**Test**
+
+- Contract: every example validates against the published schema and stable errors.
+- Idempotency: retry every mutation before/after simulated response loss.
+- Wait: message before wait, during wait, timeout, endpoint expiry, duplicate events, and concurrent waits.
+- Authorization: routine agent cannot onboard/offboard Twilio or retrieve sensitive message detail without scope.
+- End-to-end email scenario: reserve → SaaS sends → wait/assert → reply → external SaaS behavior asserted.
+- End-to-end SMS scenario: existing leased endpoint → SaaS sends → wait/assert → reply → status/effect asserted.
+
+**Exit**
+
+- An AI agent can complete the motivating workflow without the UI, while the UI visualizes the exact same durable run and evidence.
+
+### Phase 6 — Production hardening and operations
+
+**Build**
+
+- Enable the D1 outbox reconciler if synchronous sending needs recovery.
+- Enable scheduled Twilio drift checks, endpoint expiry, retention, and orphan repair.
+- Add alerting for ingest failures, lease conflicts, unknown sends, D1 overload, and stale canaries.
+- Finalize CSP, Access policies, credential rotation, log redaction, rate limits, data classification, and operator runbooks.
+- Add the production D1 retain policy and guarded deploy approvals.
+
+**Test**
+
+- Load: burst duplicate SMS callbacks and concurrent reads/writes within D1/Worker limits.
+- Chaos: D1 error, provider timeout, expired credentials, and partial retention failure.
+- Recovery: D1 Time Travel restore in staging, outbox replay, and Alchemy state recovery.
+- Security: dependency scan, webhook fuzzing, HTML sanitizer corpus, attachment abuse, auth/rate-limit tests, and attempted secret leakage.
+- Operations: rotate each credential, reconcile deliberate Twilio drift, and restore staging from the documented runbook.
+- Destruction: prove the production plan retains D1 and cannot be auto-destroyed by CI.
+
+**Exit**
+
+- On-call signals are actionable, restore/offboard procedures are rehearsed, and production deployment is approved against the open decisions below.
+
+## 16. Phase loop protocol
+
+For a long-running implementation agent, use the same loop for every phase:
+
+1. Read this document, current `AGENTS.md`/repository instructions, and the pinned version matrix.
+2. Inspect the live Alchemy plan and existing state before editing infrastructure.
+3. Choose the smallest unchecked feature and write its observable acceptance condition.
+4. Implement domain logic against ports first, then live adapter/boundary, then UI if applicable.
+5. Run targeted unit tests, full check, production build, and schema-drift check.
+6. Review `alchemy plan`; stop on unexpected replacement/deletion or singleton integration changes.
+7. Deploy only the permitted stage and run its live smoke/canary.
+8. Record evidence in the phase checklist/run log.
+9. Commit migrations and any changed snapshots/version matrix.
+10. Continue only while the deployed stage is healthy; otherwise diagnose and repair before adding scope.
+
+The loop must never automatically:
+
+- Change or offboard an unleased Twilio number.
+- Approve a non-default existing webhook.
+- Deploy an unreviewed destructive D1 migration.
+- Destroy a production stage.
+- Broaden a Cloudflare Access policy.
+- Send to an arbitrary email/phone recipient.
+- Retry an ambiguous outbound send as if it definitely failed.
+
+## 17. Key decisions still required before feature work
+
+These are concrete prerequisites, not architecture unknowns:
+
+1. **Repository/name — decided:** public [`backpine/comms-test-harness`](https://github.com/backpine/comms-test-harness), using pinned Bun `1.3.14`.
+2. **Domains:** console/API domain and a dedicated email-testing domain already or newly hosted in Cloudflare.
+3. **Cloudflare plan:** Workers paid status and Email Service arbitrary-recipient sending eligibility.
+4. **Access:** operator email allowlist or existing identity-provider details.
+5. **Twilio:** dedicated subaccount, number, API key, and permission to inspect/update its SMS webhook.
+6. **Default webhook fixture:** exact `smsUrl`/method returned for a newly clean number in that account.
+7. **Data policy:** whether real customer data is prohibited, plus retention periods and allowed test recipients.
+8. **Regions:** desired D1 location hint/data requirements. `wnam` is a reasonable starting hypothesis for a Denver/US-operated service, but legal/data locality decides it.
+9. **Agent authentication:** Cloudflare Access service token versus application bearer token.
+10. **Evidence — initial decision:** no raw MIME archive or attachment export; retain only bounded D1 content and attachment metadata.
+
+## 18. Principal risks and mitigations
+
+| Risk | Consequence | Mitigation |
+|---|---|---|
+| Alchemy/Effect 4 beta API churn | Broken build/deploy on routine update | Exact pins, controlled upgrade PR, live preview smoke |
+| Existing Twilio integration overwritten | Customer outage/data loss | Fail-closed eligibility, lease snapshot, compare/read verification, no chaining |
+| Messaging Service or Application overrides number URL | Webhook appears installed but never fires | Inspect effective config and reject override cases |
+| Twilio update race | Third-party change overwritten | Serialize, re-read immediately, restricted console access, reconcile; document residual risk |
+| Public UI leaks communications | PII exposure | Cloudflare Access despite no app user model |
+| Spoofed Twilio-style requests | Fake messages in the test harness | Accept as an explicit low-volume test-system tradeoff; require a known active destination, strict schemas, size/rate limits, and MessageSid idempotency |
+| Duplicate provider delivery | Duplicate messages/replies | Unique provider/dedupe keys and idempotent consumers |
+| Ambiguous outbound result | Duplicate send on retry | `unknown` state and manual/explicit retry policy |
+| D1 stores oversized content | Failed ingest/storage exhaustion | Bounded D1 content, attachment metadata only, explicit reject/truncate behavior, and retention |
+| Schema ahead of failed code deploy | Runtime incompatibility | Committed expand/contract migrations, Time Travel bookmark, staged rollout |
+| Alchemy destroy removes evidence | Irrecoverable loss | Production retain policies, CI guard, restore drills |
+| Catch-all becomes spam sink | Cost/abuse | Random endpoints, unknown recipient reject, TTL, rate/size limits |
+| Email reply becomes open relay | Abuse/reputation loss | Reply only to derived stored inbound sender, fixed owned From |
+| PR stages mutate shared integrations | Flaky tests/outage | Synthetic previews; serialized dedicated staging integration |
+
+## 19. Definition of production-ready
+
+The service is production-ready only when all of the following are true:
+
+- A clean Cloudflare account/stage can be provisioned from committed code and remote Alchemy state.
+- A second deployment is idempotent and its plan has no surprise replacement.
+- Production D1 cannot be removed by routine destroy.
+- Schema migrations are committed, reviewed, backward compatible, and restore has been rehearsed.
+- Browser RPC is private behind same-origin service binding; public routes are deliberately enumerated.
+- Console is edge-protected; agent and Twilio routes have separate machine/provider controls.
+- Real inbound email and SMS canaries pass.
+- Email and SMS reply destinations are server-derived from stored inbound conversations.
+- Twilio onboarding rejects every non-empty/non-verified-default effective webhook and offboarding refuses to overwrite drift.
+- Duplicate and out-of-order provider events are safe.
+- Unknown send outcomes are visible and not blindly retried.
+- Logs/metrics do not leak bodies, credentials, or raw addresses.
+- Retention, Time Travel, lease conflict, outbox, and credential-rotation runbooks have been executed in staging.
+- The motivating end-to-end agent scenario passes and leaves inspectable evidence in the console.
+
+## 20. Primary references
+
+### Alchemy
+
+- [Alchemy](https://alchemy.run/)
+- [Cloudflare Workers](https://alchemy.run/cloudflare/compute/workers/)
+- [Cloudflare setup and supported package managers](https://alchemy.run/cloudflare/setup/)
+- [Vite websites](https://alchemy.run/cloudflare/frontend/vite/)
+- [React SPAs](https://alchemy.run/cloudflare/frontend/vite-spa/)
+- [Effect HTTP API](https://alchemy.run/cloudflare/apis/effect-http-api/)
+- [Effect RPC](https://alchemy.run/apis/effect-rpc/)
+- [D1 Database resource](https://alchemy.run/providers/cloudflare/d1/database/)
+- [Email send and receive](https://alchemy.run/cloudflare/email/send-and-receive/)
+- [Domains, adoption, and DNS](https://alchemy.run/cloudflare/networking/domains/)
+- [Custom domains and routes](https://alchemy.run/cloudflare/networking/custom-domains/)
+- [Secrets Store and generated tokens](https://alchemy.run/cloudflare/security/secrets-store/)
+- [Cloudflare Access Policy resource](https://alchemy.run/providers/cloudflare/access/policy/)
+- [Cloudflare Access Application resource](https://alchemy.run/providers/cloudflare/access/application/)
+- [State stores](https://alchemy.run/state-store/)
+- [Stages](https://alchemy.run/environments/stages/)
+- [Testing](https://alchemy.run/testing/)
+- [Researched D1 + Drizzle example](https://github.com/alchemy-run/alchemy/tree/f414e001010ab87a1bbc324692978e99a259eb4a/examples/cloudflare-d1-drizzle)
+- [Researched TanStack RPC + Drizzle example](https://github.com/alchemy-run/alchemy/tree/f414e001010ab87a1bbc324692978e99a259eb4a/examples/cloudflare-tanstack-rpc-drizzle)
+- [Researched Effect Worker bridge](https://github.com/alchemy-run/alchemy/blob/f414e001010ab87a1bbc324692978e99a259eb4a/packages/alchemy/src/Cloudflare/Workers/WorkerBridge.ts)
+
+### Cloudflare
+
+- [D1 overview](https://developers.cloudflare.com/d1/)
+- [D1 limits](https://developers.cloudflare.com/d1/platform/limits/)
+- [D1 Worker binding API](https://developers.cloudflare.com/d1/worker-api/d1-database/)
+- [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/)
+- [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/)
+- [Email Handler API](https://developers.cloudflare.com/email-service/api/route-emails/email-handler/)
+- [Email Routing addresses and catch-all](https://developers.cloudflare.com/email-service/configuration/email-routing-addresses/)
+- [Email send bindings](https://developers.cloudflare.com/email-service/configuration/send-bindings/)
+- [Email Service Workers API](https://developers.cloudflare.com/email-service/api/send-emails/workers-api/)
+- [Email Service limits](https://developers.cloudflare.com/email-service/platform/limits/)
+
+### Twilio
+
+- [IncomingPhoneNumber resource](https://www.twilio.com/docs/phone-numbers/api/incomingphonenumber-resource)
+- [Messaging Services](https://www.twilio.com/docs/messaging/services)
+- [Messaging Service resource](https://www.twilio.com/docs/messaging/api/service-resource)
+- [Messaging webhooks](https://www.twilio.com/docs/usage/webhooks/messaging-webhooks)
+- [Webhook connection overrides and retries](https://www.twilio.com/docs/usage/webhooks/webhooks-connection-overrides)
+- [Message resource and statuses](https://www.twilio.com/docs/messaging/api/message-resource)
+
+## 21. First implementation ticket status
+
+- [x] Create the independent public repository.
+- [x] Add the pinned workspace, typed package boundaries, complete initial Alchemy graph, D1 schema/migration, private Effect RPC Worker, Vite/TanStack/Effect Atom console, and same-origin service-binding proxy.
+- [x] Verify strict TypeScript, unit tests, migration no-op behavior, browser build, and website Worker build locally.
+- [ ] Authenticate to the chosen Cloudflare account, deploy a fresh stage, verify the homepage-to-D1 RPC call, repeat the deployment to prove no-op behavior, and test isolated preview destruction.
+
+Email MX, outbound sending, and Twilio mutation remain deliberately disabled until their feature phases. The repository is now a functioning blueprint; the only remaining Phase 0 evidence is account-owned live deployment.

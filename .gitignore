@@ -1,0 +1,11 @@
+.alchemy/
+.dev.vars
+.env
+.env.*
+!.env.example
+dist/
+dist-worker/
+node_modules/
+test-results/
+coverage/
+*.tsbuildinfo
