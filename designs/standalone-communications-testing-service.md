@@ -37,7 +37,7 @@ This split follows the Alchemy V2 examples directly. TanStack Start owns the web
 - [x] Call that RPC on homepage load through Atom RPC and the website's private `/rpc` service binding.
 - [x] Add schema-first `GET /health` and `GET /v1/system` HTTP API boilerplate with a typed client contract.
 - [x] Add strict TypeScript without application type assertions, unit tests, TanStack Start client/server builds, Alchemy live-stack test scaffolding, CI, architecture documentation, and a frozen Bun lockfile.
-- [ ] Authenticate Alchemy to a contributor's Cloudflare account and perform the first live stage deployment. This is intentionally account-owned and is not committed to the repository.
+- [x] Authenticate Alchemy to the Backpine-owned Cloudflare account and deploy the complete `dev_backpine` stage.
 
 ## 2. Product definition
 
@@ -1301,7 +1301,7 @@ Each phase ends in a deployable vertical slice. Do not begin the next phase mere
 - [x] Build: strict TypeScript plus TanStack Start client and server bundles compile.
 - [x] Migration: Alchemy generates a reviewable initial SQL migration and snapshot; a second generation is a no-op.
 - [x] Isolation: the RPC Worker is configured with no public `workers.dev` URL; only the declared HTTP API is public.
-- [ ] Live: deploy to a Cloudflare account, load `/`, and prove `/rpc` reaches the private API and reads the migrated D1 table.
+- [x] Live: deploy `dev_backpine`, load `/`, and prove `/rpc` reaches the private backend and reads the migrated D1 table.
 - [ ] Deploy: prove a second live deployment is a no-op and preview destroy targets only its own stage.
 
 **Exit**
@@ -1578,4 +1578,4 @@ The service is production-ready only when all of the following are true:
 - [x] Verify strict TypeScript, unit tests, migration no-op behavior, TanStack Start production build, and typed live-stack test compilation locally.
 - [ ] Authenticate to the chosen Cloudflare account, deploy a fresh stage, verify the homepage-to-D1 RPC call, repeat the deployment to prove no-op behavior, and test isolated preview destruction.
 
-Email MX, outbound sending, and Twilio mutation remain deliberately disabled until their feature phases. The repository is now a functioning blueprint; the only remaining Phase 0 evidence is account-owned live deployment.
+Email MX, outbound sending, and Twilio mutation remain deliberately disabled until their feature phases. The repository is now a live functioning blueprint. Remaining Phase 0 evidence is full no-op convergence on repeat deploy and isolated preview destruction; the first repeat run kept D1, schema, API, and RPC backend as no-ops but rebuilt the website.
