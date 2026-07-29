@@ -1,10 +1,16 @@
 import { useAtomValue } from "@effect/atom-react";
+import { createFileRoute } from "@tanstack/react-router";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
 import { helloAtom } from "../rpc-client.ts";
 
-export function Home() {
+export const Route = createFileRoute("/")({
+  component: Home,
+});
+
+function Home() {
   const result = useAtomValue(helloAtom);
   const hello = AsyncResult.getOrElse(result, () => undefined);
+  const isServer = typeof window === "undefined";
 
   return (
     <main className="shell">
@@ -23,15 +29,13 @@ export function Home() {
           <span className="status-label">Effect RPC</span>
         </div>
         {AsyncResult.isFailure(result) ? (
-          <p className="error">The API did not respond. Check the local Alchemy process.</p>
-        ) : hello === undefined ? (
+          <p className="error">The API did not respond. Check the Alchemy process.</p>
+        ) : isServer || hello === undefined ? (
           <p>Connecting to the API…</p>
         ) : (
           <div className="response">
             <strong>{hello.message}</strong>
-            <span>
-              D1 is ready. Test records: {hello.testRecordCount}
-            </span>
+            <span>D1 is ready. Test records: {hello.testRecordCount}</span>
           </div>
         )}
       </section>

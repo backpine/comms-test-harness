@@ -1,44 +1,49 @@
-import { AppRpcs } from "@comms-test-harness/contracts";
-import { Database, TestRecords } from "@comms-test-harness/db";
-import {
-  makeHello,
-  type TestRecordRepository,
-} from "@comms-test-harness/domain";
+import { HealthResponse, PublicApi } from "@comms-test-harness/contracts";
+import { makeHello } from "@comms-test-harness/domain";
 import * as Cloudflare from "alchemy/Cloudflare";
-import * as Drizzle from "alchemy/Drizzle";
-import { count } from "drizzle-orm";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
+import * as Path from "effect/Path";
+import * as Etag from "effect/unstable/http/Etag";
+import * as HttpPlatform from "effect/unstable/http/HttpPlatform";
+import * as HttpRouter from "effect/unstable/http/HttpRouter";
+import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
+import { TestRecordRepositoryLive } from "./repositories/test-record-repository.ts";
 
-export default class Api extends Cloudflare.Workers.RpcWorker<Api>()(
+const HttpPlatformStub = Layer.succeed(HttpPlatform.HttpPlatform, {
+  fileResponse: () => Effect.die("HttpPlatform.fileResponse is not supported"),
+  fileWebResponse: () =>
+    Effect.die("HttpPlatform.fileWebResponse is not supported"),
+});
+
+export default class Api extends Cloudflare.Worker<Api>()(
   "Api",
-  {
-    main: import.meta.url,
-    schema: AppRpcs,
-    url: false,
-  },
+  { main: import.meta.url },
   Effect.gen(function* () {
-    const database = yield* Database;
-    const d1 = yield* Cloudflare.D1.QueryDatabase(database);
-    const db = yield* Drizzle.D1(d1);
+    const testRecords = yield* TestRecordRepositoryLive;
 
-    const testRecordRepository: TestRecordRepository = {
-      count: db
-        .select({ value: count() })
-        .from(TestRecords)
-        .pipe(
-          Effect.map(([row]) => row?.value ?? 0),
-          Effect.orDie,
+    const healthGroup = HttpApiBuilder.group(PublicApi, "Health", (handlers) =>
+      handlers.handle("health", () =>
+        Effect.succeed(
+          new HealthResponse({
+            status: "ok",
+            service: "comms-test-harness-api",
+          }),
         ),
-    };
-
-    const handlers = AppRpcs.toLayer({
-      hello: () => makeHello(testRecordRepository),
-    });
-
-    return RpcServer.toHttpEffect(AppRpcs).pipe(
-      Effect.provide(Layer.mergeAll(handlers, RpcSerialization.layerJson)),
+      ),
     );
+
+    const systemGroup = HttpApiBuilder.group(PublicApi, "System", (handlers) =>
+      handlers.handle("systemInfo", () => makeHello(testRecords)),
+    );
+
+    return {
+      fetch: yield* HttpRouter.toHttpEffect(
+        HttpApiBuilder.layer(PublicApi).pipe(
+          Layer.provide([healthGroup, systemGroup]),
+          Layer.provide([Etag.layer, HttpPlatformStub, Path.layer]),
+        ),
+      ),
+    };
   }).pipe(Effect.provide(Cloudflare.D1.QueryDatabaseBinding)),
 ) {}

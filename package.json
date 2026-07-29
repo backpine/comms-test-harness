@@ -21,7 +21,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "vite build apps/web && vite build apps/web --ssr src/web-worker.ts --outDir dist-worker",
+    "build": "vite build apps/web",
     "check": "bun run typecheck && bun run test && bun run build",
     "db:generate": "alchemy deploy scripts/migrations.run.ts --stage migration-dev --yes",
     "deploy": "alchemy deploy",
@@ -31,6 +31,7 @@
     "dev": "alchemy dev",
     "plan": "alchemy plan",
     "test": "vitest run",
+    "test:live": "bun test test/live/stack.live.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

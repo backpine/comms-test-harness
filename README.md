@@ -1,9 +1,10 @@
 # Comms Test Harness
 
 An open-source, Cloudflare-native foundation for testing email and SMS
-integrations. The current milestone is the working platform blueprint: Alchemy
-provisions D1 and two Workers, Effect owns the API/RPC runtime, and a React app
-calls a typed hello RPC on its homepage.
+integrations. The current milestone is a working Alchemy V2 blueprint: Alchemy
+provisions D1, a TanStack Start website, a private Effect RPC backend, and a
+public schema-first Effect HTTP API. The homepage calls a typed hello RPC on
+load.
 
 The project is intentionally small: D1 is its only application storage service,
 outbound email will use Cloudflare's structured transactional API, and Twilio
@@ -25,8 +26,18 @@ bun alchemy dev
 
 Alchemy runs the application locally while using a real, stage-isolated D1
 database in your Cloudflare account. Open the printed `websiteUrl`; the home
-page calls Effect RPC through the website's private service binding and shows
-the row count from `test_records`.
+page calls Effect RPC through TanStack Start's `/rpc` server route and a private
+service binding. The result includes the row count from `test_records`.
+
+The printed `apiUrl` exposes the starter HTTP API:
+
+```text
+GET /health
+GET /v1/system
+```
+
+Both routes come from a shared Effect `HttpApi` contract, so handlers and typed
+clients are checked against the same request and response schemas.
 
 ## Provision a stage
 
@@ -46,6 +57,16 @@ bun run check
 
 This runs strict TypeScript, unit tests, and the Vite client/Worker build.
 
+With Cloudflare credentials configured, exercise a temporary real deployment
+in both Alchemy dev and deploy modes:
+
+```bash
+bun run test:live
+```
+
+Set `NO_DESTROY=1` only when intentionally preserving the test stage for
+inspection.
+
 After changing `packages/db/src/schema.ts`, generate and review the next
 committed migration with:
 
@@ -56,16 +77,17 @@ bun run db:generate
 ## Repository layout
 
 ```text
-apps/api             Effect RPC Cloudflare Worker
-apps/web             React, TanStack Router, Atom RPC, and RPC proxy
-packages/contracts   Shared Effect schemas and RPC contracts
+apps/api             Public Effect HttpApi Worker and private RPC Worker
+apps/web             TanStack Start, React, TanStack Router, and Atom RPC
+packages/contracts   Shared HTTP API schemas and RPC contracts
 packages/domain      Business services and repository ports
 packages/db          Drizzle schema, migrations, and Alchemy D1 resource
 docs                 Architecture, versions, and product design
 alchemy.run.ts        Complete cloud resource graph
 ```
 
-See [the architecture](./docs/architecture.md) and [the design](./designs/standalone-communications-testing-service.md).
+See [the architecture](./docs/architecture.md) and
+[the design](./designs/standalone-communications-testing-service.md).
 
 ## License
 

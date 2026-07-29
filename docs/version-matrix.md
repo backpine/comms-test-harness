@@ -12,6 +12,7 @@ contributors get the same types and runtime behavior.
 | Drizzle ORM / Kit | `1.0.0-rc.4` |
 | React / React DOM | `19.2.8` |
 | TanStack Router | `1.170.18` |
+| TanStack Start | `1.168.32` |
 | Vite | `8.1.5` |
 | TypeScript | `7.0.2` |
 
