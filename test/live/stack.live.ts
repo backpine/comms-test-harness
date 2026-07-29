@@ -47,7 +47,7 @@ describe.each([true, false])("CommsTestHarness (dev: %p)", (dev) => {
     ),
     Layer.unwrap,
     Layer.provide(FetchHttpClient.layer),
-    Layer.provide(RpcSerialization.layerJson),
+    Layer.provide(RpcSerialization.layerNdjson),
   );
 
   test(

@@ -213,7 +213,7 @@ API Worker ------------------------> Cloudflare Email send binding
 | Concern | TanStack Start website | Private RPC backend | Public HTTP API |
 |---|---|---|---|
 | Public role | Console SSR/assets and same-origin `/rpc` route | None | Narrow agent and provider endpoints |
-| Runtime style | Framework Worker built by Alchemy's Vite integration | Alchemy `RpcWorker` | Alchemy `Cloudflare.Worker` + Effect `HttpApi` |
+| Runtime style | Framework Worker built by Alchemy's Vite integration | Alchemy `Cloudflare.Worker` + `RpcServer` | Alchemy `Cloudflare.Worker` + Effect `HttpApi` |
 | Exposure | Yes, behind Access | Private service binding only | Explicit API/webhook routes |
 | D1/secrets | No application data binding | D1 and UI application services | D1 and provider integrations |
 | Email/cron events | None | None | Yes, when implemented |
@@ -237,9 +237,9 @@ Using separate `hooks` and `api` hosts lets security policy remain explicit. A r
 #### Browser query
 
 1. TanStack Start renders a file route.
-2. A module-scoped Atom RPC query posts JSON to same-origin `/rpc`.
+2. A module-scoped Atom RPC query posts an NDJSON-framed request to same-origin `/rpc`.
 3. The `/rpc` TanStack server route forwards the unchanged request through its private `BACKEND` service binding.
-4. The private RPC Worker decodes the shared schema, runs an Effect service, and returns JSON.
+4. The private RPC Worker decodes the shared schema, runs an Effect service, and returns NDJSON-framed RPC output.
 5. A mutation carries a `reactivityKeys` value; related query atoms re-fetch.
 
 #### Inbound email
@@ -284,7 +284,7 @@ comms-test-harness/
 │   ├── api/
 │   │   ├── src/
 │   │   │   ├── worker.ts                 # public Effect HttpApi Worker
-│   │   │   ├── backend.ts                # private Effect RpcWorker
+│   │   │   ├── backend.ts                # private Worker + Effect RpcServer
 │   │   │   ├── runtime.ts                # layer assembly only
 │   │   │   ├── rpc/
 │   │   │   ├── http/
@@ -658,10 +658,11 @@ Do not apply browser CORS globally. The browser calls same-origin `/rpc`; the ex
 
 The implemented blueprint keeps the two API modalities explicit:
 
-1. `backend.ts` uses Alchemy's `Cloudflare.Workers.RpcWorker` shorthand, `AppRpcs`, and JSON RPC serialization. It is private and optimized for the typed UI transport.
-2. `worker.ts` uses an ordinary `Cloudflare.Worker`. Its Init phase constructs `HttpApiBuilder.group` layers, assembles them under `HttpApiBuilder.layer(PublicApi)`, yields `HttpRouter.toHttpEffect(...)` once, and returns `{ fetch }`.
-3. Both Workers obtain their D1 repository from the typed `Cloudflare.D1.QueryDatabaseBinding`; neither casts an environment or database handle.
-4. The public Worker will return `email` and `scheduled` Effect handlers on the same surface when those features are implemented.
+1. `backend.ts` uses the Effect RPC guide's primary long-form setup: an ordinary `Cloudflare.Worker`, an `AppRpcs.toLayer(...)` handler layer constructed during Init, and `{ fetch: RpcServer.toHttpEffect(...) }` with `RpcSerialization.layerNdjson`.
+2. The browser client uses the same `RpcSerialization.layerNdjson` layer. The server and client therefore share both the exact `AppRpcs` value and wire format.
+3. `worker.ts` uses an ordinary `Cloudflare.Worker`. Its Init phase constructs `HttpApiBuilder.group` layers, assembles them under `HttpApiBuilder.layer(PublicApi)`, yields `HttpRouter.toHttpEffect(...)` once, and returns `{ fetch }`.
+4. Both Workers obtain their D1 repository from the typed `Cloudflare.D1.QueryDatabaseBinding`; neither casts an environment or database handle.
+5. The public Worker will return `email` and `scheduled` Effect handlers on the same surface when those features are implemented.
 
 This is the Alchemy V2 HTTP API guide's schema-first structure rather than a custom router. The exact imports and builder signatures are compiled against the pinned Effect beta because these modules remain under `effect/unstable/*`.
 
@@ -1148,7 +1149,7 @@ export class ConsoleClient extends AtomRpc.Service<ConsoleClient>()(
     group: ConsoleRpcs,
     protocol: RpcClient.layerProtocolHttp({ url: "/rpc" }).pipe(
       Layer.provide(FetchHttpClient.layer),
-      Layer.provide(RpcSerialization.layerJson),
+      Layer.provide(RpcSerialization.layerNdjson),
     ),
   },
 ) {}

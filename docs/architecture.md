@@ -18,8 +18,9 @@ HTTP client
 - `apps/web` is a TanStack Start application. Its generated server Worker owns
   SSR and the same-origin `/rpc` file route; there is no hand-written asset
   proxy Worker.
-- `apps/api/src/backend.ts` is the private `RpcWorker`. The website reaches it
-  only through the typed `BACKEND` service binding.
+- `apps/api/src/backend.ts` is an ordinary private `Cloudflare.Worker` whose
+  Init phase returns the `HttpEffect` produced by `RpcServer.toHttpEffect`.
+  The website reaches it only through the typed `BACKEND` service binding.
 - `apps/api/src/worker.ts` is the public `Cloudflare.Worker`. It implements the
   shared Effect `HttpApi` description and is the future home of agent and
   provider HTTP endpoints.

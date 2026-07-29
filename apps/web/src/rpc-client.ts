@@ -8,7 +8,7 @@ export class AppClient extends AtomRpc.Service<AppClient>()("AppClient", {
   group: AppRpcs,
   protocol: RpcClient.layerProtocolHttp({ url: "/rpc" }).pipe(
     Layer.provide(FetchHttpClient.layer),
-    Layer.provide(RpcSerialization.layerJson),
+    Layer.provide(RpcSerialization.layerNdjson),
   ),
 }) {}
 

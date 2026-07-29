@@ -6,21 +6,24 @@ import * as Layer from "effect/Layer";
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 import { TestRecordRepositoryLive } from "./repositories/test-record-repository.ts";
 
-export default class Backend extends Cloudflare.Workers.RpcWorker<Backend>()(
+export default Cloudflare.Worker(
   "Backend",
   {
     main: import.meta.url,
-    schema: AppRpcs,
     url: false,
   },
   Effect.gen(function* () {
     const testRecords = yield* TestRecordRepositoryLive;
-    const handlers = AppRpcs.toLayer({
+    const handlersLayer = AppRpcs.toLayer({
       hello: () => makeHello(testRecords),
     });
 
-    return RpcServer.toHttpEffect(AppRpcs).pipe(
-      Effect.provide(Layer.mergeAll(handlers, RpcSerialization.layerJson)),
-    );
+    return {
+      fetch: RpcServer.toHttpEffect(AppRpcs).pipe(
+        Effect.provide(
+          Layer.mergeAll(handlersLayer, RpcSerialization.layerNdjson),
+        ),
+      ),
+    };
   }).pipe(Effect.provide(Cloudflare.D1.QueryDatabaseBinding)),
-) {}
+);
